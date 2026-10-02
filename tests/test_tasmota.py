@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from time import monotonic as time
 from types import ModuleType
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -170,6 +171,14 @@ class TestParseEnergyPayload:
         assert current == pytest.approx(0.0)
         assert total == pytest.approx(50.0)
         assert today == pytest.approx(1.0)
+
+    def test_negative_voltage_is_not_a_fresh_measurement(self) -> None:
+        payload = json.dumps({"ENERGY": {"Power": 100, "Voltage": -115, "Total": 50, "Today": 1.0}})
+        assert parse_energy_payload(payload) is None
+
+    def test_null_voltage_key_is_not_a_fresh_measurement(self) -> None:
+        payload = json.dumps({"ENERGY": {"Power": 100, "Voltage": None, "Total": 50, "Today": 1.0}})
+        assert parse_energy_payload(payload) is None
 
     def test_empty_energy_dict(self) -> None:
         assert parse_energy_payload('{"ENERGY": {}}') is None
@@ -478,3 +487,92 @@ def test_non_object_energy_does_not_interrupt_following_telemetry(energy, monkey
     listener._get_or_create.return_value.apply.assert_called_once_with(
         125.0, 250.0, 0.5, 0.0, 0.0, 0.0, received_at=100.0
     )
+
+
+def test_first_device_register_failure_recovers_on_next_sample(monkeypatch):
+    """One failed registration must not block the other device or replay telemetry.
+
+    Both samples are queued before the deferred GLib callback runs. Only the
+    first device's service register() raises, and only once. The second device
+    publishes. The next sample for the first device registers and publishes
+    that new reading, without a second copy of the other device or the old sample.
+    """
+
+    class MemoryBus:
+        def __init__(self, private=False):
+            self.private = private
+
+    class MemoryService:
+        created: ClassVar[list["MemoryService"]] = []
+
+        def __init__(self, service_name, bus=None, register=False):
+            self.service_name = service_name
+            self.bus = bus
+            self.paths = {}
+            self.writes = []
+            self.registered = False
+            self.created.append(self)
+            self._fail_register = len(self.created) == 1
+
+        def add_path(self, path, value):
+            self.paths[path] = value
+
+        def register(self):
+            if self._fail_register:
+                self._fail_register = False
+                raise RuntimeError("synthetic register failure")
+            self.registered = True
+
+        def __setitem__(self, path, value):
+            self.paths[path] = value
+            self.writes.append((path, value))
+
+    monkeypatch.setattr(_mod, "MqttClient", MagicMock())
+    monkeypatch.setattr(_mod, "CallbackAPIVersion", MagicMock())
+    monkeypatch.setattr(_mod.dbus, "SystemBus", MemoryBus)
+    monkeypatch.setattr(_mod, "VeDbusService", MemoryService)
+    queued = []
+    monkeypatch.setattr(_mod.GLib, "idle_add", queued.append)
+
+    listener = MqttEnergyListener("127.0.0.1", 1883)
+    listener._on_message(None, None, _sensor_msg("plug_a", {"Power": 11, "Voltage": 230}))
+    listener._on_message(None, None, _sensor_msg("plug_b", {"Power": 22, "Voltage": 240}))
+    assert listener.inverters() == []
+    assert listener._pending_scheduled is True
+    assert len(queued) == 1
+
+    first_result = queued.pop()()
+    assert first_result is False
+    assert listener._pending_scheduled is False
+    assert listener._pending == {}
+    assert [item.topic for item in listener.inverters()] == ["plug_b"]
+    published = listener.inverters()[0]
+    assert published._dbusservice.registered is True
+    assert published._dbusservice.paths["/Ac/Power"] == 22.0
+    assert published._dbusservice.paths["/Ac/L1/Voltage"] == 240.0
+    failed = MemoryService.created[0]
+    assert failed.registered is False
+    assert failed.writes == []
+    assert 11.0 not in failed.paths.values()
+    second_writes = list(published._dbusservice.writes)
+
+    listener._on_message(None, None, _sensor_msg("plug_a", {"Power": 33, "Voltage": 250}))
+    assert listener._pending_scheduled is True
+    assert len(queued) == 1
+    second_result = queued.pop()()
+    assert second_result is False
+    assert listener._pending_scheduled is False
+    assert listener._pending == {}
+
+    topics = [item.topic for item in listener.inverters()]
+    assert topics == ["plug_b", "plug_a"]
+    recovered = listener.inverters()[1]
+    assert recovered._dbusservice is MemoryService.created[2]
+    assert recovered._dbusservice.registered is True
+    assert recovered._dbusservice.paths["/Ac/Power"] == 33.0
+    assert recovered._dbusservice.paths["/Ac/L1/Voltage"] == 250.0
+    assert 11.0 not in recovered._dbusservice.paths.values()
+    assert all(value != 11.0 for _path, value in recovered._dbusservice.writes)
+    assert published._dbusservice.writes == second_writes
+    assert published._dbusservice.paths["/Ac/Power"] == 22.0
+    assert len(MemoryService.created) == 3
