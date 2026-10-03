@@ -105,6 +105,10 @@ def parse_energy_payload(
         yesterday = float(energy.get("Yesterday", 0.0))
         if not all(math.isfinite(value) for value in (power, voltage, total, today, yesterday)):
             return None
+        # Tasmota ENERGY.Voltage is AC volts; a negative reading is not a usable
+        # measurement (zero remains allowed and zeros derived current).
+        if voltage < 0:
+            return None
         current = round(power / voltage, 2) if voltage > 0 else 0.0
         if not math.isfinite(current):
             return None
